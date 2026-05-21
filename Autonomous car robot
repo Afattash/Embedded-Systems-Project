@@ -1,0 +1,385 @@
+#define DELAY_10_US() asm { nop; nop; nop; nop; nop; \
+nop; nop; nop; nop; nop; \
+nop; nop; nop; nop; nop; \
+nop; nop; nop; nop; nop; }
+
+#define kp 8
+#define kd 1
+
+enum e_fsm {
+IDLE = 0,
+LINE,
+TUNNEL,
+WALL
+};
+
+enum e_mm {
+FWD = 0,
+BWD,
+PIV_L,
+PIV_R,
+CST,
+STP
+};
+
+volatile enum e_fsm phs = IDLE;
+
+void PWM_init(void) {
+PR2 = 250;
+CCP1CON = 0x0C;
+CCP2CON = 0x0C;
+T2CON = 0x06;
+}
+
+void interrupt(void) {
+if (INTCON & 0x02) {
+phs = LINE;
+INTCON &= 0xFD;
+}
+}
+/*
+* @param left: 0 -> Forward ultrasonic, 1 -> Left ultrasonic, 2 -> Right ultrasonic
+*
+* RD7 -> TRIG FRONT
+* RD6 -> ECHO FRONT
+* RD5 -> TRIG LEFT
+* RD4 -> ECHO LEFT
+* RB3 -> TRIG RIGHT
+* RB4 -> ECHO RIGHT
+*/
+int read_ultrasonic(char sens) {
+unsigned int time = 0;
+
+switch (sens) {
+case 1: {
+PORTD |= 0x20;
+DELAY_10_US();
+PORTD &= 0xDF;
+
+TMR1H = 0;
+TMR1L = 0;
+while ((PORTD & 0x10) == 0x00) {
+if (((unsigned int)(TMR1H << 8) | TMR1L) > 2100)
+return 255;
+}
+
+TMR1H = 0;
+TMR1L = 0;
+while ((PORTD & 0x10) != 0x00) {
+time = (unsigned int)((TMR1H << 8) | TMR1L);
+if (time > 2100)
+return 255;
+}
+return time / 58;
+}
+
+case 0: {
+PORTD |= 0x80;
+DELAY_10_US();
+PORTD &= 0x7F;
+
+TMR1H = 0;
+TMR1L = 0;
+while ((PORTD & 0x40) == 0) {
+if (((unsigned int)(TMR1H << 8) | TMR1L) > 2100)
+return 255;
+}
+
+TMR1H = 0;
+TMR1L = 0;
+while ((PORTD & 0x40) != 0x00) {
+time = (unsigned int)((TMR1H << 8) | TMR1L);
+if (time > 2100)
+return 255;
+}
+return time / 58;
+}
+
+case 2: {
+PORTB |= 0x08;
+DELAY_10_US();
+PORTB &= 0xF7;
+
+TMR1H = 0;
+TMR1L = 0;
+while ((PORTB & 0x10) == 0x00) {
+if (((unsigned int)(TMR1H << 8) | TMR1L) > 2100)
+return 255;
+}
+
+TMR1H = 0;
+TMR1L = 0;
+while ((PORTB & 0x10) != 0x00) {
+time = (unsigned int)((TMR1H << 8) | TMR1L);
+if (time > 2100)
+return 255;
+}
+
+return time / 58;
+}
+
+default:
+return 255;
+}
+}
+
+void cdel_ms(unsigned int ms) {
+unsigned int i = 0;
+for (i = 0; i < ms; i++) {
+TMR0 = 6;
+INTCON &= 0xFB;
+while (!(INTCON & 0x04));
+}
+}
+
+void set_pduty(unsigned int l_duty, unsigned int r_duty) {
+CCPR1L = l_duty >> 2;
+CCP1CON = (CCP1CON & 0xCF) | ((l_duty & 0x03) << 4);
+
+CCPR2L = r_duty >> 2;
+CCP2CON = (CCP2CON & 0xCF) | ((r_duty & 0x03) << 4);
+}
+
+void mov_sdir(unsigned int l_duty, unsigned int r_duty, enum e_mm mode) {
+PORTD &= 0xF0;
+
+switch (mode) {
+case FWD:
+PORTD |= 0x0A;
+break;
+case BWD:
+PORTD |= 0x05;
+break;
+case PIV_L:
+PORTD |= 0x06;
+break;
+case PIV_R:
+PORTD |= 0x09;
+break;
+case STP:
+default:
+PORTD |= 0x0F;
+set_pduty(0, 0);
+return;
+}
+set_pduty(l_duty, r_duty);
+}
+
+
+unsigned int read_ldr(void) {
+ADCON0 |= 0x04;
+while (ADCON0 & 0x04);
+return (unsigned int)(((ADRESH & 0x03) << 8) | ADRESL);
+}
+
+void servo_90(void){
+PORTB |= 0x20;
+cdel_ms(2);
+PORTB &= 0xDF;
+cdel_ms(18);
+}
+
+void main(void) {
+unsigned int dist_frnt = 0;
+unsigned int dist_left = 0;
+unsigned int dist_right = 0;
+unsigned char phase_swap_cnt = 0;
+int drv;
+unsigned char fc = 0;
+
+unsigned int lvr = 0;
+unsigned int lvl = 0;
+
+int error = 0;
+int last_err = 0;
+int left_speed = 0;
+int right_speed = 0;
+
+TRISB = 0x17;
+TRISC = 0x00;
+TRISD = 0x50;
+TRISE = 0x02;
+
+PWM_init();
+
+OPTION_REG = 0xC2;
+T1CON = 0x21;
+ADCON0 = 0x71;
+ADCON1 = 0xC0;
+INTCON |= 0x90;
+OPTION_REG &= 0xBF;
+
+phs = IDLE;
+while (phs == IDLE);
+cdel_ms(3000);
+
+phs = LINE;
+
+while (1) {
+switch (phs) {
+case TUNNEL: {
+if(read_ldr() < 350) {
+phase_swap_cnt++;
+} else {
+phase_swap_cnt = 0;
+}
+
+if(phase_swap_cnt >= 3){
+phs = WALL;
+PORTB &= 0x7F;
+phase_swap_cnt = 0;
+continue;
+}
+
+if ((PORTB & 0x06) == 0x00) {
+mov_sdir(400, 400, FWD);
+} else if ((PORTB & 0x06) == 0x02) {
+mov_sdir(400, 400, PIV_L);
+} else if ((PORTB & 0x06) == 0x04) {
+mov_sdir(400, 400, PIV_R);
+}
+break;
+}
+
+case LINE: {
+if(read_ldr() >= 500) {
+phase_swap_cnt++;
+} else {
+phase_swap_cnt = 0;
+}
+
+if(phase_swap_cnt >= 3){
+phs = TUNNEL;
+PORTB |= 0x80;
+phase_swap_cnt = 0;
+continue;
+}
+
+if ((PORTB & 0x06) == 0x00) {
+mov_sdir(300, 300, FWD);
+} else if ((PORTB & 0x06) == 0x02) {
+mov_sdir(300, 300, PIV_L);
+} else if ((PORTB & 0x06) == 0x04) {
+mov_sdir(300, 300, PIV_R);
+} else if ((PORTB & 0x06) == 0x06) {
+while ((PORTB & 0x06) != 0x04) {
+mov_sdir(300, 300, PIV_L);
+}
+}
+break;
+}
+
+case WALL: {
+if((PORTB & 0x06) == 0x06){
+mov_sdir(0, 0, STP);
+cdel_ms(200);
+servo_90();
+while(1);
+}
+
+if(!fc){
+dist_frnt = read_ultrasonic(0);
+} else{
+dist_frnt = 255;
+}
+fc = (fc + 1) % 4;
+
+dist_left = read_ultrasonic(1);
+cdel_ms(10);
+dist_right = read_ultrasonic(2);
+
+if (dist_left > 20 && dist_frnt < 14) {
+mov_sdir(0, 0, STP);
+cdel_ms(70);
+
+do {
+mov_sdir(300, 300, PIV_L);
+dist_frnt = read_ultrasonic(0);
+cdel_ms(5);
+} while (dist_frnt < 20);
+
+mov_sdir(0, 0, STP);
+cdel_ms(80);
+
+do {
+mov_sdir(300, 300, FWD);
+dist_left = read_ultrasonic(1);
+cdel_ms(4);
+} while (dist_left > 30);
+
+mov_sdir(0, 0, STP);
+cdel_ms(80);
+
+lvl = dist_left;
+lvr = read_ultrasonic(2);
+last_err = (signed int)lvr - (signed int)lvl;
+}
+else if (dist_frnt < 14) {
+mov_sdir(0, 0, STP);
+cdel_ms(70);
+
+do {
+mov_sdir(300, 300, PIV_R);
+dist_frnt = read_ultrasonic(0);
+cdel_ms(5);
+} while (dist_frnt < 20);
+
+mov_sdir(0, 0, STP);
+cdel_ms(80);
+
+do {
+mov_sdir(300, 300, FWD);
+dist_right = read_ultrasonic(2);
+cdel_ms(2);
+} while (dist_right > 30);
+
+lvr = dist_right;
+lvl = read_ultrasonic(1);
+last_err = (signed int)lvr - (signed int)lvl;
+} else {
+if (dist_left < 8) dist_left = 8;
+else if (dist_left > 20)
+dist_left = lvl ? lvl : 20;
+if (dist_right > 20)
+dist_right = lvr ? lvr : 20;
+else if(dist_right < 8) dist_right = 8;
+
+error = dist_right - dist_left;
+
+if (error > 8) error = 8;
+if (error < -8) error = -8;
+
+drv = error - last_err;
+
+if (error >= -1 && error <= 1) {
+mov_sdir(300, 300, FWD);
+} else {
+left_speed = 300 + ((error * kp) + (drv * kd));
+right_speed = 300 - ((error * kp) + (drv * kd));
+
+if (left_speed > 460)
+left_speed = 460;
+if (left_speed < 260)
+left_speed = 260;
+
+if (right_speed > 460)
+right_speed = 460;
+if (right_speed < 260)
+right_speed = 260;
+
+mov_sdir(left_speed, right_speed, FWD);
+}
+
+lvl = dist_left;
+lvr = dist_right;
+last_err = error;
+}
+
+break;
+}
+
+default:
+mov_sdir(0, 0, STP);
+}
+}
+}
